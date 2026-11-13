@@ -1,21 +1,37 @@
-"""FastAPI service: column-level dependency analysis for decommissioned source columns."""
+"""FastAPI service: column-level dependency analysis for decommissioned source columns.
+
+ additionally exposes the carrier signed-receipt correction batch APIs
+ (签收更正批) backed by SQLite in the data volume.
+"""
 from __future__ import annotations
 
+import os
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from .lineage import AggregatedAnalysisError, AnalysisError, Analyzer
+from .warehouse import (
+    STATUS_PENDING,
+    STATUS_REJECTED,
+    STATUS_WAREHOUSED,
+    BatchContentConflict,
+    CorrectionItemInput,
+    Warehouse,
+)
 
 app = FastAPI(
     title="配送数仓列依赖分析服务",
     description=(
         "基于 SQLGlot 解析（不执行 SQL），沿别名、普通星号与非递归 CTE 跨模型追踪"
         "待下线源列的引用，按模型输出依赖该列的输出列以及 WHERE / JOIN ON 条件，"
-        "每项附引用链。不支持聚合、集合运算与 CTE 之外的子查询。"
+        "每项附引用链。不支持聚合、集合运算与 CTE 之外的子查询。\n\n"
+        "另提供承运商**签收更正批**接口：批号按承运商从 1 连续编号，越过缺口的批次"
+        "先存不生效，补齐后按批号连续入仓；每批入仓时逐票核对更正前签收值，"
+        "对不上则退回该批并允许更正后重交；批次与签收事实存于数据卷中的 SQLite。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -183,3 +199,189 @@ def analyze(request: AnalyzeRequest) -> AnalyzeResponse:
 @app.get("/healthz", include_in_schema=False)
 def healthz() -> dict:
     return {"status": "ok"}
+
+
+# --------------------------------------------------------------------------
+# 签收更正批（carrier signed-receipt correction batches）
+# --------------------------------------------------------------------------
+
+def get_warehouse() -> Warehouse:
+    """按环境变量 WAREHOUSE_DB_PATH 懒加载数据卷中的 SQLite 仓库。"""
+    warehouse = getattr(app.state, "warehouse", None)
+    if warehouse is None:
+        warehouse = Warehouse(os.environ.get("WAREHOUSE_DB_PATH", "warehouse.db"))
+        app.state.warehouse = warehouse
+    return warehouse
+
+
+class CorrectionItem(BaseModel):
+    waybill_no: str = Field(..., min_length=1, description="运单号（同批不得重复）")
+    prev_signed_at: Optional[int] = Field(
+        ..., description="更正前签收时刻（UTC 秒），null 表示此前未签收；"
+        "入仓时须与仓内当前值逐票核对一致")
+    new_signed_at: Optional[int] = Field(
+        ..., description="更正后签收时刻（UTC 秒），null 表示更正为未签收（撤销签收）")
+
+
+class CorrectionBatchRequest(BaseModel):
+    carrier: str = Field(..., min_length=1, description="承运商")
+    batch_no: int = Field(..., ge=1, description="批号（该承运商从 1 连续编号）")
+    items: list[CorrectionItem] = Field(
+        ..., min_length=1, description="本批更正明细（每票一条）")
+
+
+class ConflictItem(BaseModel):
+    waybill_no: str = Field(..., description="核对不通过的运单号")
+    expected_prev_signed_at: Optional[int] = Field(
+        ..., description="批中声明的更正前签收时刻（UTC 秒，null 表示未签收）")
+    actual_signed_at: Optional[int] = Field(
+        ..., description="入仓当时仓内实际签收时刻（UTC 秒，null 表示未签收）")
+
+
+class ChainRejection(BaseModel):
+    batch_no: int = Field(..., description="被退回的批号")
+    conflicts: list[ConflictItem] = Field(..., description="该批的逐票冲突")
+
+
+class CorrectionBatchResponse(BaseModel):
+    carrier: str
+    batch_no: int
+    status: str = Field(
+        ..., description=f"{STATUS_PENDING}=待处理（越过缺口先存，未生效）/ "
+        f"{STATUS_WAREHOUSED}=已入仓 / {STATUS_REJECTED}=已退回（可更正后重交）")
+    idempotent_replay: bool = Field(
+        ..., description="是否为同内容原样重传（直接返回已存结果，未重算）")
+    conflicts: list[ConflictItem] = Field(
+        default_factory=list, description="本批被退回时的逐票冲突")
+    applied_batches: list[int] = Field(
+        default_factory=list, description="本次调用触发连续入仓的批号（按入仓顺序）")
+    chain_rejection: Optional[ChainRejection] = Field(
+        None, description="连续入仓过程中被退回的批（处理到该批停止，后续批继续等待）")
+    warehoused_through: int = Field(..., description="入仓进度：已连续入仓到的批号")
+    next_batch_no: int = Field(..., description="下一批号（入仓进度 + 1）")
+
+
+class RejectedBatchInfo(BaseModel):
+    batch_no: int
+    conflicts: list[ConflictItem]
+
+
+class SignedDetail(BaseModel):
+    waybill_no: str
+    signed_at: int = Field(..., description="当前签收时刻（UTC 秒）")
+    source_batch_no: int = Field(..., description="产生该事实的批号")
+
+
+class CarrierStateResponse(BaseModel):
+    carrier: str
+    warehoused_through: int = Field(..., description="入仓进度：已连续入仓到的批号")
+    next_batch_no: int = Field(
+        ..., description="下一批号（入仓进度 + 1）；缺口或退回批即停在该号，需催补/更正")
+    pending_batches: list[int] = Field(
+        default_factory=list, description="已接收但尚未生效（待处理）的批号")
+    rejected_batches: list[RejectedBatchInfo] = Field(
+        default_factory=list, description="已退回待更正重交的批及其冲突")
+    signed: list[SignedDetail] = Field(
+        default_factory=list, description="当前已签收明细（同一时点快照）")
+
+
+class BatchConflictResponse(BaseModel):
+    detail: dict
+
+
+BATCH2_FIRST_EXAMPLE = {
+    "carrier": "顺路快运",
+    "batch_no": 2,
+    "items": [
+        {"waybill_no": "WB1001", "prev_signed_at": 1794470400,
+         "new_signed_at": 1794557700},
+        {"waybill_no": "WB1002", "prev_signed_at": 1794475800,
+         "new_signed_at": None},
+    ],
+}
+
+BATCH1_FILL_EXAMPLE = {
+    "carrier": "顺路快运",
+    "batch_no": 1,
+    "items": [
+        {"waybill_no": "WB1001", "prev_signed_at": None,
+         "new_signed_at": 1794470400},
+        {"waybill_no": "WB1002", "prev_signed_at": None,
+         "new_signed_at": 1794475800},
+        {"waybill_no": "WB1003", "prev_signed_at": None,
+         "new_signed_at": None},
+    ],
+}
+
+
+@app.post(
+    "/corrections/batches",
+    response_model=CorrectionBatchResponse,
+    responses={
+        400: {"model": ErrorResponse, "description": "入参校验错误（如同批运单号重复）"},
+        409: {"model": BatchConflictResponse,
+              "description": "同批号已存在且内容不一致（待处理/已入仓批次拒绝覆盖）"},
+    },
+    summary="提交承运商签收更正批",
+    description=(
+        "批号按承运商从 1 连续编号。越过缺口的批次先存为待处理、不生效；"
+        "缺口补齐后从入仓进度 +1 起按批号连续入仓。每批入仓时逐票核对"
+        "更正前签收时刻与仓内当前值，对不上则退回该批（返回批号与冲突运单），"
+        "已入仓的前序批不撤销，后续批继续等待；已退回批次可更正后重交。"
+        "待处理/已入仓批次同内容重传不重算，换内容则 409 拒绝。"
+        "典型用法：先交第 2 批（待处理），再补第 1 批（触发两批连续入仓）。"),
+)
+def submit_correction_batch(
+    request: CorrectionBatchRequest = Body(
+        ...,
+        openapi_examples={
+            "先交第2批（越过缺口，先存不生效）": {
+                "summary": "第 2 批先到：补签 WB1001、撤销 WB1002，因缺第 1 批先存不生效",
+                "value": BATCH2_FIRST_EXAMPLE,
+            },
+            "再补第1批（补齐缺口，两批按批号连续入仓）": {
+                "summary": "补交第 1 批：初始签收事实入仓，随后第 2 批自动核对入仓",
+                "value": BATCH1_FILL_EXAMPLE,
+            },
+        },
+    ),
+    warehouse: Warehouse = Depends(get_warehouse),
+) -> CorrectionBatchResponse:
+    waybills = [item.waybill_no for item in request.items]
+    dups = sorted({w for w in waybills if waybills.count(w) > 1})
+    if dups:
+        raise HTTPException(400, [{"message": f"同批运单号重复: {dups}"}])
+    items = [
+        CorrectionItemInput(
+            waybill_no=item.waybill_no,
+            prev_signed_at=item.prev_signed_at,
+            new_signed_at=item.new_signed_at,
+        )
+        for item in request.items
+    ]
+    try:
+        result = warehouse.submit_batch(request.carrier, request.batch_no, items)
+    except BatchContentConflict as exc:
+        raise HTTPException(409, {
+            "message": str(exc),
+            "carrier": exc.carrier,
+            "batch_no": exc.batch_no,
+            "existing_status": exc.status,
+        })
+    return CorrectionBatchResponse(**result)
+
+
+@app.get(
+    "/corrections/{carrier}",
+    response_model=CarrierStateResponse,
+    summary="查询承运商当前入仓状态",
+    description=(
+        "按承运商返回同一时点（单事务快照）的入仓进度、下一批号、"
+        "待处理/已退回批次与当前已签收明细。例如先交第 2 批再补第 1 批后，"
+        "查询「顺路快运」可见入仓进度为 2、下一批号为 3。"),
+)
+def get_carrier_state(
+    carrier: str,
+    warehouse: Warehouse = Depends(get_warehouse),
+) -> CarrierStateResponse:
+    return CarrierStateResponse(**warehouse.carrier_state(carrier))

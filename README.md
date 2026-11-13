@@ -8,6 +8,72 @@
 - 依赖该源列的 **WHERE / JOIN ON（含 USING）/ QUALIFY 条件**，每项附引用链。
   条件依赖**不计入**输出列。
 
+另提供承运商**签收更正批**接口（见下文「签收更正批 API」）：更正批晚到时先存不生效，
+补齐缺口后按批号连续入仓，撤销与补签不按到达顺序入账。
+
+## 签收更正批 API
+
+承运商的签收更正批按承运商从 **1 连续编号**。每批提交若干票更正：
+`waybill_no`（运单号，同批不得重复）、`prev_signed_at` / `new_signed_at`
+（更正前/后签收时刻，UTC 秒，`null` 表示未签收）。
+
+- `POST /corrections/batches` —— 提交一个更正批；
+- `GET /corrections/{carrier}` —— 查询该承运商**同一时点**的入仓进度、下一批号、
+  待处理/已退回批次与当前已签收明细。
+
+处理规则：
+
+- **越过缺口先存不生效**：批号跳过缺口的批次存为 `pending`；缺口补齐后，
+  从「入仓进度 + 1」起按批号**连续入仓**。
+- **入仓当时逐票核对**：每批入仓时，逐票核对批中声明的 `prev_signed_at`
+  与仓内当前签收值。对不上就**退回该批**（`rejected`，响应含批号与冲突运单），
+  已入仓的前序批不撤销，后续批继续等待；更正后可按原批号重交。
+- **幂等**：待处理/已入仓的批次原样重传直接返回已存结果（`idempotent_replay=true`，
+  不重算）；换内容则 `409` 拒绝。并发提交语义相同。已退回批次允许更正后重交。
+- **持久化与原子性**：批次与签收事实保存在数据卷中的 SQLite
+  （`WAREHOUSE_DB_PATH`，Compose 下为 `/data/warehouse.db`，卷 `dw-data`）；
+  每批事实与入仓进度在同一事务里一起生效。
+
+提交响应的 `status`：`pending`（待处理）/ `warehoused`（已入仓）/ `rejected`（已退回）。
+
+### 样例流程（Swagger 可直接 Try it out）
+
+`POST /corrections/batches` 的请求体自带两个样例，先交第 2 批、再补第 1 批：
+
+```bash
+# 1) 第 2 批先到：越过缺口，先存不生效（status=pending，入仓进度仍为 0）
+curl -X POST http://localhost:8000/corrections/batches \
+  -H 'Content-Type: application/json' \
+  --data @examples/corrections_batch2_first.json
+
+# 2) 补交第 1 批：触发 1、2 两批按批号连续入仓（applied_batches=[1,2]）
+curl -X POST http://localhost:8000/corrections/batches \
+  -H 'Content-Type: application/json' \
+  --data @examples/corrections_batch1_fill.json
+
+# 3) 查询：入仓进度 2、下一批号 3；WB1001 以第 2 批补签时刻为准，
+#    WB1002 已被第 2 批撤销（不在已签收明细中）
+curl http://localhost:8000/corrections/顺路快运
+```
+
+查询响应示例：
+
+```json
+{
+  "carrier": "顺路快运",
+  "warehoused_through": 2,
+  "next_batch_no": 3,
+  "pending_batches": [],
+  "rejected_batches": [],
+  "signed": [
+    {"waybill_no": "WB1001", "signed_at": 1794557700, "source_batch_no": 2}
+  ]
+}
+```
+
+值班员可据 `next_batch_no` 与 `pending_batches` / `rejected_batches`
+找出该催补或待更正的批次。
+
 ## 追踪规则
 
 - 别名：`receiver_zip_old AS zip` 会把依赖从 `zip` 继续追到源列。
@@ -106,16 +172,17 @@ curl -X POST http://localhost:8000/analyze \
 python -m venv --without-pip .venv   # 若系统带 ensurepip 可直接 python -m venv .venv
 .venv/bin/pip install -r requirements.txt
 PYTHONPATH=. .venv/bin/uvicorn app.main:app --reload
-.venv/bin/pytest                       # 37 个测试
+.venv/bin/pytest                       # 54 个测试
 ```
 
 ## 目录
 
 ```
 app/
-  main.py        FastAPI 路由、请求/响应模型、Swagger 样例与入参校验
+  main.py        FastAPI 路由、请求/响应模型、Swagger 样例与入参校验（含签收更正批 API）
   lineage.py     SQLGlot 解析与列级血缘分析（不执行 SQL）
-  tests/         分析器与 API 测试
-examples/        邮编改名场景的完整请求样例
-Dockerfile, docker-compose.yml, requirements.txt
+  warehouse.py   签收更正批的 SQLite 存储与按批号连续入仓处理
+  tests/         分析器、API 与更正批测试
+examples/        邮编改名场景的完整请求样例 + 签收更正批样例（先交第 2 批、再补第 1 批）
+Dockerfile, docker-compose.yml（含 dw-data 数据卷）, requirements.txt
 ```

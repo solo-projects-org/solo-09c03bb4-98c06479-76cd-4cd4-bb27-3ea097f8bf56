@@ -1,0 +1,8 @@
+{
+  "carrier": "顺路快运",
+  "batch_no": 2,
+  "items": [
+    {"waybill_no": "WB1001", "prev_signed_at": 1794470400, "new_signed_at": 1794557700},
+    {"waybill_no": "WB1002", "prev_signed_at": 1794475800, "new_signed_at": null}
+  ]
+}
